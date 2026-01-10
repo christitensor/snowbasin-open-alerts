@@ -2,6 +2,7 @@ import json
 import os
 import re
 from typing import Dict, List, Tuple
+
 import requests
 from bs4 import BeautifulSoup
 
@@ -28,9 +29,14 @@ TRAIL_MARKERS = [
     ("Delayed", " Trail Delayed"),
 ]
 
+# Gate rows on Snowbasin show statuses like "Trail Closed/Open" but the names end in "Gate"
+# Example: "Easter Bowl Gate  Trail Closed"  [oai_citation:1‡Snowbasin Resort](https://www.snowbasin.com/the-mountain/mountain-report/?utm_source=chatgpt.com)
+GATE_NAME_REGEX = re.compile(r".*\bGate$", re.IGNORECASE)
+GATE_SPECIAL_NAMES = {"The Wallow"}  # appears in Access Gates list  [oai_citation:2‡Snowbasin Resort](https://www.snowbasin.com/the-mountain/mountain-report/?utm_source=chatgpt.com)
+
 
 def fetch_lines() -> List[str]:
-    r = requests.get(URL, headers={"User-Agent": USER_AGENT}, timeout=20)
+    r = requests.get(URL, headers={"User-Agent": USER_AGENT}, timeout=25)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     text = soup.get_text("\n")
@@ -38,25 +44,18 @@ def fetch_lines() -> List[str]:
     return [ln for ln in lines if ln]
 
 
-def slice_section(lines: List[str], start_key: str, end_key: str) -> List[str]:
-    try:
-        start = next(i for i, ln in enumerate(lines) if ln == start_key)
-    except StopIteration:
-        return []
-    try:
-        end = next(i for i, ln in enumerate(lines[start + 1 :], start + 1) if ln == end_key)
-    except StopIteration:
-        end = len(lines)
-    return lines[start:end]
-
-
-def parse_rows(section_lines: List[str], kind: str) -> Dict[str, str]:
+def parse_items_from_full_page(lines: List[str], kind: str) -> List[Tuple[str, str, str]]:
+    """
+    Returns a list of (group, name, status) parsed from the whole page.
+    We don't rely on exact section headings (those often vary in get_text()).
+    We use 'Toggle accordion' headers to keep a rough group context.
+    """
     markers = LIFT_MARKERS if kind == "lifts" else TRAIL_MARKERS
-    out: Dict[str, str] = {}
-    group = kind.capitalize()
+    items: List[Tuple[str, str, str]] = []
 
-    for ln in section_lines:
-        # Group headers show up like: "Needles Toggle accordion"
+    group = "Unknown"
+
+    for ln in lines:
         if "Toggle accordion" in ln:
             group = ln.replace("Toggle accordion", "").strip()
             continue
@@ -72,17 +71,34 @@ def parse_rows(section_lines: List[str], kind: str) -> Dict[str, str]:
 
         status, idx = found
         name = ln[:idx].strip()
-        key = f"{group} :: {name}"
-        out[key] = status
+        items.append((group, name, status))
 
-    return out
+    return items
+
+
+def is_gate_row(group: str, name: str) -> bool:
+    # Primary rule: name ends with "Gate"
+    if GATE_NAME_REGEX.match(name):
+        return True
+    # Special cases that appear in Access Gates list
+    if name in GATE_SPECIAL_NAMES:
+        return True
+    # Backup rule: if we're inside an "Access Gates" accordion/group
+    if "access gates" in group.lower():
+        return True
+    return False
 
 
 def load_state() -> Dict[str, Dict[str, str]]:
     if not os.path.exists(STATE_FILE):
-        return {"lifts": {}, "trails": {}}
+        return {"lifts": {}, "trails": {}, "gates": {}}
     with open(STATE_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+        state = json.load(f)
+    # Backward-compatible defaults
+    state.setdefault("lifts", {})
+    state.setdefault("trails", {})
+    state.setdefault("gates", {})
+    return state
 
 
 def save_state(state: Dict[str, Dict[str, str]]) -> None:
@@ -112,57 +128,88 @@ def pushover_notify(title: str, message: str) -> None:
     resp.raise_for_status()
 
 
+def fmt(items: List[str], limit: int = 30) -> str:
+    shown = items[:limit]
+    more = len(items) - len(shown)
+    msg = "\n- " + "\n- ".join(shown) if shown else ""
+    if more > 0:
+        msg += f"\n(+{more} more)"
+    return msg
+
+
 def main():
     lines = fetch_lines()
 
-    # UPDATED SLICING:
-    # Snowbasin text includes "### Lifts Toggle accordion" before lift rows, then "## Trails"
-    lifts_section = slice_section(lines, "### Lifts Toggle accordion", "## Trails")
-    trails_section = slice_section(lines, "## Trails", "## Parking")
+    lift_items = parse_items_from_full_page(lines, "lifts")
+    trail_like_items = parse_items_from_full_page(lines, "trails")
 
-    current = {
-        "lifts": parse_rows(lifts_section, "lifts"),
-        "trails": parse_rows(trails_section, "trails"),
-    }
+    lifts: Dict[str, str] = {}
+    trails: Dict[str, str] = {}
+    gates: Dict[str, str] = {}
+
+    for group, name, status in lift_items:
+        key = f"{group} :: {name}"
+        lifts[key] = status
+
+    for group, name, status in trail_like_items:
+        key = f"{group} :: {name}"
+        if is_gate_row(group, name):
+            gates[key] = status
+        else:
+            trails[key] = status
+
+    current = {"lifts": lifts, "trails": trails, "gates": gates}
 
     if DEBUG:
-        print(f"Total text lines: {len(lines)}")
-        print(f"Lift section lines: {len(lifts_section)} | Trail section lines: {len(trails_section)}")
-        print(f"Parsed lifts: {len(current['lifts'])} | Parsed trails: {len(current['trails'])}")
-        print("Sample lift rows:", list(current["lifts"].items())[:5])
-        print("Sample trail rows:", list(current["trails"].items())[:5])
+        print(f"Total lines: {len(lines)}")
+        print(f"Parsed lifts: {len(lifts)}")
+        print(f"Parsed trails (excluding gates): {len(trails)}")
+        print(f"Parsed access gates: {len(gates)}")
+        print("Sample lifts:", list(lifts.items())[:5])
+        print("Sample trails:", list(trails.items())[:5])
+        print("Sample gates:", list(gates.items())[:10])
 
     prev = load_state()
-    first_run = (not prev["lifts"] and not prev["trails"])
+    first_run = (
+        not prev.get("lifts", {}) and
+        not prev.get("trails", {}) and
+        not prev.get("gates", {})
+    )
 
     newly_open_lifts = sorted(
-        k for k, v in current["lifts"].items()
-        if v == "Open" and prev["lifts"].get(k) != "Open"
+        k for k, v in lifts.items()
+        if v == "Open" and prev.get("lifts", {}).get(k) != "Open"
     )
     newly_open_trails = sorted(
-        k for k, v in current["trails"].items()
-        if v == "Open" and prev["trails"].get(k) != "Open"
+        k for k, v in trails.items()
+        if v == "Open" and prev.get("trails", {}).get(k) != "Open"
+    )
+    newly_open_gates = sorted(
+        k for k, v in gates.items()
+        if v == "Open" and prev.get("gates", {}).get(k) != "Open"
     )
 
     save_state(current)
 
-    # Optional: fail loudly if parsing looks broken
-    if len(current["lifts"]) == 0 and len(current["trails"]) == 0:
-        raise RuntimeError("Parsing returned 0 lifts and 0 trails — section keys likely changed.")
+    # Fail loudly only if everything is empty (parsing broke)
+    if len(lifts) == 0 and len(trails) == 0 and len(gates) == 0:
+        raise RuntimeError("Parsing returned 0 lifts, 0 trails, and 0 gates — page structure likely changed.")
 
     if first_run:
         print("Initialized state; no notification on first run.")
         return
 
-    if not newly_open_lifts and not newly_open_trails:
+    if not newly_open_lifts and not newly_open_trails and not newly_open_gates:
         print("No new opens.")
         return
 
     parts = []
     if newly_open_lifts:
-        parts.append("New lifts open:\n- " + "\n- ".join(newly_open_lifts[:30]))
+        parts.append("New lifts open:" + fmt(newly_open_lifts))
     if newly_open_trails:
-        parts.append("New trails open:\n- " + "\n- ".join(newly_open_trails[:30]))
+        parts.append("New trails open:" + fmt(newly_open_trails))
+    if newly_open_gates:
+        parts.append("New access gates open:" + fmt(newly_open_gates))
 
     pushover_notify("Snowbasin update ✅ something opened", "\n\n".join(parts))
     print("Notification sent.")
