@@ -12,43 +12,62 @@ STATE_FILE = os.environ.get("STATE_FILE", "snowbasin_state.json")
 PUSHOVER_USER = os.environ.get("PUSHOVER_USER", "")
 PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN", "")
 
-USER_AGENT = os.environ.get("USER_AGENT", "snowbasin-watch/1.0 (personal use)")
+# Make it look more like a browser (sometimes helps with anti-bot / alternate markup)
+USER_AGENT = os.environ.get(
+    "USER_AGENT",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
 DEBUG = os.environ.get("DEBUG", "0") == "1"
 
 LIFT_MARKERS = [
-    ("Open", " Lift Open"),
-    ("Closed", " Lift Closed"),
-    ("On Hold", " Lift On Hold"),
-    ("Scheduled", " Lift Scheduled"),
-    ("Delayed", " Lift Delayed"),
+    ("Open", "Lift Open"),
+    ("Closed", "Lift Closed"),
+    ("On Hold", "Lift On Hold"),
+    ("Scheduled", "Lift Scheduled"),
+    ("Delayed", "Lift Delayed"),
 ]
 TRAIL_MARKERS = [
-    ("Open", " Trail Open"),
-    ("Closed", " Trail Closed"),
-    ("Expected", " Trail Expected"),
-    ("Delayed", " Trail Delayed"),
+    ("Open", "Trail Open"),
+    ("Closed", "Trail Closed"),
+    ("Expected", "Trail Expected"),
+    ("Delayed", "Trail Delayed"),
 ]
 
-# Gate rows on Snowbasin show statuses like "Trail Closed/Open" but the names end in "Gate"
-# Example: "Easter Bowl Gate  Trail Closed"  [oai_citation:1‡Snowbasin Resort](https://www.snowbasin.com/the-mountain/mountain-report/?utm_source=chatgpt.com)
 GATE_NAME_REGEX = re.compile(r".*\bGate$", re.IGNORECASE)
-GATE_SPECIAL_NAMES = {"The Wallow"}  # appears in Access Gates list  [oai_citation:2‡Snowbasin Resort](https://www.snowbasin.com/the-mountain/mountain-report/?utm_source=chatgpt.com)
+GATE_SPECIAL_NAMES = {"The Wallow"}  # shows up in Access Gates list  [oai_citation:1‡Snowbasin Resort](https://www.snowbasin.com/the-mountain/mountain-report/)
+
+
+def normalize_text(s: str) -> str:
+    # Normalize non-breaking spaces and a couple other common “special spaces”
+    s = s.replace("\xa0", " ").replace("\u2009", " ").replace("\u202f", " ")
+    # Collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 def fetch_lines() -> List[str]:
-    r = requests.get(URL, headers={"User-Agent": USER_AGENT}, timeout=25)
+    r = requests.get(
+        URL,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        timeout=25,
+    )
     r.raise_for_status()
+
     soup = BeautifulSoup(r.text, "html.parser")
     text = soup.get_text("\n")
-    lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
+    text = text.replace("\xa0", " ")  # important: normalize before splitting/regex
+    lines = [normalize_text(ln) for ln in text.splitlines()]
     return [ln for ln in lines if ln]
 
 
 def parse_items_from_full_page(lines: List[str], kind: str) -> List[Tuple[str, str, str]]:
     """
-    Returns a list of (group, name, status) parsed from the whole page.
-    We don't rely on exact section headings (those often vary in get_text()).
-    We use 'Toggle accordion' headers to keep a rough group context.
+    Returns list of (group, name, status) parsed from whole page.
+    Uses 'Toggle accordion' headers for grouping.  [oai_citation:2‡Snowbasin Resort](https://www.snowbasin.com/the-mountain/mountain-report/)
     """
     markers = LIFT_MARKERS if kind == "lifts" else TRAIL_MARKERS
     items: List[Tuple[str, str, str]] = []
@@ -60,16 +79,16 @@ def parse_items_from_full_page(lines: List[str], kind: str) -> List[Tuple[str, s
             group = ln.replace("Toggle accordion", "").strip()
             continue
 
-        found: Tuple[str, int] | None = None
+        found: Tuple[str, int, str] | None = None
         for status, token in markers:
             idx = ln.rfind(token)
             if idx != -1 and (found is None or idx > found[1]):
-                found = (status, idx)
+                found = (status, idx, token)
 
         if not found:
             continue
 
-        status, idx = found
+        status, idx, token = found
         name = ln[:idx].strip()
         items.append((group, name, status))
 
@@ -77,13 +96,10 @@ def parse_items_from_full_page(lines: List[str], kind: str) -> List[Tuple[str, s
 
 
 def is_gate_row(group: str, name: str) -> bool:
-    # Primary rule: name ends with "Gate"
     if GATE_NAME_REGEX.match(name):
         return True
-    # Special cases that appear in Access Gates list
     if name in GATE_SPECIAL_NAMES:
         return True
-    # Backup rule: if we're inside an "Access Gates" accordion/group
     if "access gates" in group.lower():
         return True
     return False
@@ -94,7 +110,6 @@ def load_state() -> Dict[str, Dict[str, str]]:
         return {"lifts": {}, "trails": {}, "gates": {}}
     with open(STATE_FILE, "r", encoding="utf-8") as f:
         state = json.load(f)
-    # Backward-compatible defaults
     state.setdefault("lifts", {})
     state.setdefault("trails", {})
     state.setdefault("gates", {})
@@ -140,6 +155,18 @@ def fmt(items: List[str], limit: int = 30) -> str:
 def main():
     lines = fetch_lines()
 
+    # DEBUG: prove we’re seeing the “Lift …” and “Trail …” rows in GitHub Actions logs
+    if DEBUG:
+        lift_like = [ln for ln in lines if "Lift " in ln or " Lift" in ln][:12]
+        trail_like = [ln for ln in lines if "Trail " in ln or " Trail" in ln][:12]
+        print(f"Total lines: {len(lines)}")
+        print("Sample lines containing 'Lift':")
+        for ln in lift_like:
+            print("  ", ln)
+        print("Sample lines containing 'Trail':")
+        for ln in trail_like:
+            print("  ", ln)
+
     lift_items = parse_items_from_full_page(lines, "lifts")
     trail_like_items = parse_items_from_full_page(lines, "trails")
 
@@ -148,8 +175,7 @@ def main():
     gates: Dict[str, str] = {}
 
     for group, name, status in lift_items:
-        key = f"{group} :: {name}"
-        lifts[key] = status
+        lifts[f"{group} :: {name}"] = status
 
     for group, name, status in trail_like_items:
         key = f"{group} :: {name}"
@@ -158,42 +184,28 @@ def main():
         else:
             trails[key] = status
 
-    current = {"lifts": lifts, "trails": trails, "gates": gates}
-
     if DEBUG:
-        print(f"Total lines: {len(lines)}")
         print(f"Parsed lifts: {len(lifts)}")
         print(f"Parsed trails (excluding gates): {len(trails)}")
-        print(f"Parsed access gates: {len(gates)}")
-        print("Sample lifts:", list(lifts.items())[:5])
-        print("Sample trails:", list(trails.items())[:5])
-        print("Sample gates:", list(gates.items())[:10])
+        print(f"Parsed gates: {len(gates)}")
+        print("Sample parsed lifts:", list(lifts.items())[:5])
+        print("Sample parsed trails:", list(trails.items())[:5])
+        print("Sample parsed gates:", list(gates.items())[:10])
+
+    current = {"lifts": lifts, "trails": trails, "gates": gates}
 
     prev = load_state()
-    first_run = (
-        not prev.get("lifts", {}) and
-        not prev.get("trails", {}) and
-        not prev.get("gates", {})
-    )
+    first_run = (not prev["lifts"] and not prev["trails"] and not prev["gates"])
 
-    newly_open_lifts = sorted(
-        k for k, v in lifts.items()
-        if v == "Open" and prev.get("lifts", {}).get(k) != "Open"
-    )
-    newly_open_trails = sorted(
-        k for k, v in trails.items()
-        if v == "Open" and prev.get("trails", {}).get(k) != "Open"
-    )
-    newly_open_gates = sorted(
-        k for k, v in gates.items()
-        if v == "Open" and prev.get("gates", {}).get(k) != "Open"
-    )
+    newly_open_lifts = sorted(k for k, v in lifts.items() if v == "Open" and prev["lifts"].get(k) != "Open")
+    newly_open_trails = sorted(k for k, v in trails.items() if v == "Open" and prev["trails"].get(k) != "Open")
+    newly_open_gates = sorted(k for k, v in gates.items() if v == "Open" and prev["gates"].get(k) != "Open")
 
     save_state(current)
 
-    # Fail loudly only if everything is empty (parsing broke)
+    # If everything is empty, that usually means the runner got a different “shell” page / blocked page.
     if len(lifts) == 0 and len(trails) == 0 and len(gates) == 0:
-        raise RuntimeError("Parsing returned 0 lifts, 0 trails, and 0 gates — page structure likely changed.")
+        raise RuntimeError("Parsing returned 0 lifts, 0 trails, and 0 gates — runner may be receiving different HTML.")
 
     if first_run:
         print("Initialized state; no notification on first run.")
