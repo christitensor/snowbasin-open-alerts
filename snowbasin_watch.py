@@ -12,11 +12,22 @@ PUSHOVER_USER = os.environ.get("PUSHOVER_USER", "")
 PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN", "")
 
 USER_AGENT = os.environ.get("USER_AGENT", "snowbasin-watch/1.0 (personal use)")
+DEBUG = os.environ.get("DEBUG", "0") == "1"
 
-LIFT_MARKERS = [("Open", " Lift Open"), ("Closed", " Lift Closed"), ("On Hold", " Lift On Hold"),
-                ("Scheduled", " Lift Scheduled"), ("Delayed", " Lift Delayed")]
-TRAIL_MARKERS = [("Open", " Trail Open"), ("Closed", " Trail Closed"),
-                 ("Expected", " Trail Expected"), ("Delayed", " Trail Delayed")]
+LIFT_MARKERS = [
+    ("Open", " Lift Open"),
+    ("Closed", " Lift Closed"),
+    ("On Hold", " Lift On Hold"),
+    ("Scheduled", " Lift Scheduled"),
+    ("Delayed", " Lift Delayed"),
+]
+TRAIL_MARKERS = [
+    ("Open", " Trail Open"),
+    ("Closed", " Trail Closed"),
+    ("Expected", " Trail Expected"),
+    ("Delayed", " Trail Delayed"),
+]
+
 
 def fetch_lines() -> List[str]:
     r = requests.get(URL, headers={"User-Agent": USER_AGENT}, timeout=20)
@@ -26,16 +37,18 @@ def fetch_lines() -> List[str]:
     lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
     return [ln for ln in lines if ln]
 
+
 def slice_section(lines: List[str], start_key: str, end_key: str) -> List[str]:
     try:
         start = next(i for i, ln in enumerate(lines) if ln == start_key)
     except StopIteration:
         return []
     try:
-        end = next(i for i, ln in enumerate(lines[start+1:], start+1) if ln == end_key)
+        end = next(i for i, ln in enumerate(lines[start + 1 :], start + 1) if ln == end_key)
     except StopIteration:
         end = len(lines)
     return lines[start:end]
+
 
 def parse_rows(section_lines: List[str], kind: str) -> Dict[str, str]:
     markers = LIFT_MARKERS if kind == "lifts" else TRAIL_MARKERS
@@ -43,6 +56,7 @@ def parse_rows(section_lines: List[str], kind: str) -> Dict[str, str]:
     group = kind.capitalize()
 
     for ln in section_lines:
+        # Group headers show up like: "Needles Toggle accordion"
         if "Toggle accordion" in ln:
             group = ln.replace("Toggle accordion", "").strip()
             continue
@@ -63,15 +77,18 @@ def parse_rows(section_lines: List[str], kind: str) -> Dict[str, str]:
 
     return out
 
+
 def load_state() -> Dict[str, Dict[str, str]]:
     if not os.path.exists(STATE_FILE):
         return {"lifts": {}, "trails": {}}
     with open(STATE_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
+
 def save_state(state: Dict[str, Dict[str, str]]) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, sort_keys=True)
+
 
 def pushover_notify(title: str, message: str) -> None:
     if not PUSHOVER_USER or not PUSHOVER_TOKEN:
@@ -94,10 +111,13 @@ def pushover_notify(title: str, message: str) -> None:
     )
     resp.raise_for_status()
 
+
 def main():
     lines = fetch_lines()
 
-    lifts_section = slice_section(lines, "## Lifts", "## Trails")
+    # UPDATED SLICING:
+    # Snowbasin text includes "### Lifts Toggle accordion" before lift rows, then "## Trails"
+    lifts_section = slice_section(lines, "### Lifts Toggle accordion", "## Trails")
     trails_section = slice_section(lines, "## Trails", "## Parking")
 
     current = {
@@ -105,13 +125,30 @@ def main():
         "trails": parse_rows(trails_section, "trails"),
     }
 
+    if DEBUG:
+        print(f"Total text lines: {len(lines)}")
+        print(f"Lift section lines: {len(lifts_section)} | Trail section lines: {len(trails_section)}")
+        print(f"Parsed lifts: {len(current['lifts'])} | Parsed trails: {len(current['trails'])}")
+        print("Sample lift rows:", list(current["lifts"].items())[:5])
+        print("Sample trail rows:", list(current["trails"].items())[:5])
+
     prev = load_state()
     first_run = (not prev["lifts"] and not prev["trails"])
 
-    newly_open_lifts = sorted(k for k, v in current["lifts"].items() if v == "Open" and prev["lifts"].get(k) != "Open")
-    newly_open_trails = sorted(k for k, v in current["trails"].items() if v == "Open" and prev["trails"].get(k) != "Open")
+    newly_open_lifts = sorted(
+        k for k, v in current["lifts"].items()
+        if v == "Open" and prev["lifts"].get(k) != "Open"
+    )
+    newly_open_trails = sorted(
+        k for k, v in current["trails"].items()
+        if v == "Open" and prev["trails"].get(k) != "Open"
+    )
 
     save_state(current)
+
+    # Optional: fail loudly if parsing looks broken
+    if len(current["lifts"]) == 0 and len(current["trails"]) == 0:
+        raise RuntimeError("Parsing returned 0 lifts and 0 trails — section keys likely changed.")
 
     if first_run:
         print("Initialized state; no notification on first run.")
@@ -129,6 +166,7 @@ def main():
 
     pushover_notify("Snowbasin update ✅ something opened", "\n\n".join(parts))
     print("Notification sent.")
+
 
 if __name__ == "__main__":
     main()
