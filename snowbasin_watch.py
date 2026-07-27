@@ -199,6 +199,14 @@ def fmt(items: List[str], limit: int = 30) -> str:
 
 
 def main():
+    if os.environ.get("FORCE_TEST_NOTIFY", "").lower() in ("1", "true"):
+        telegram_notify(
+            "Snowbasin Watch: test",
+            "This is a manual test notification. If you got this, Telegram delivery is working.",
+        )
+        print("Test notification sent.")
+        return
+
     lines = fetch_lines()
 
     lifts, trails, gates = parse_report(lines)
