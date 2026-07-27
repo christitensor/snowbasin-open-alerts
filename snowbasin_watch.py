@@ -176,17 +176,29 @@ def telegram_notify(title: str, message: str) -> None:
         print(message)
         return
 
+    # TELEGRAM_CHAT_ID may be a single chat/group ID or a comma-separated list of them,
+    # so this one bot can notify a group chat and/or several individual chats.
+    chat_ids = [c.strip() for c in TELEGRAM_CHAT_ID.split(",") if c.strip()]
     text = f"{title}\n\n{message}\n\n{URL}"
-    resp = requests.post(
-        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-        timeout=20,
-        data={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "disable_web_page_preview": "true",
-        },
-    )
-    resp.raise_for_status()
+
+    errors = []
+    for chat_id in chat_ids:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            timeout=20,
+            data={
+                "chat_id": chat_id,
+                "text": text,
+                "disable_web_page_preview": "true",
+            },
+        )
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            errors.append(f"{chat_id}: {e}")
+
+    if errors:
+        raise RuntimeError("Telegram send failed for: " + "; ".join(errors))
 
 
 def fmt(items: List[str], limit: int = 30) -> str:
