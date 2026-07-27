@@ -9,8 +9,8 @@ from bs4 import BeautifulSoup
 URL = "https://www.snowbasin.com/the-mountain/mountain-report/"
 STATE_FILE = os.environ.get("STATE_FILE", "snowbasin_state.json")
 
-PUSHOVER_USER = os.environ.get("PUSHOVER_USER", "")
-PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # Make it look more like a browser (sometimes helps with anti-bot / alternate markup)
 USER_AGENT = os.environ.get(
@@ -169,23 +169,21 @@ def save_state(state: Dict[str, Dict[str, str]]) -> None:
         json.dump(state, f, indent=2, sort_keys=True)
 
 
-def pushover_notify(title: str, message: str) -> None:
-    if not PUSHOVER_USER or not PUSHOVER_TOKEN:
-        print("Missing PUSHOVER_USER/PUSHOVER_TOKEN; skipping push.")
+def telegram_notify(title: str, message: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID; skipping notification.")
         print(title)
         print(message)
         return
 
+    text = f"{title}\n\n{message}\n\n{URL}"
     resp = requests.post(
-        "https://api.pushover.net/1/messages.json",
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
         timeout=20,
         data={
-            "token": PUSHOVER_TOKEN,
-            "user": PUSHOVER_USER,
-            "title": title,
-            "message": message,
-            "url": URL,
-            "url_title": "Snowbasin Mountain Report",
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "disable_web_page_preview": "true",
         },
     )
     resp.raise_for_status()
@@ -249,7 +247,7 @@ def main():
     if newly_open_gates:
         parts.append("New access gates open:" + fmt(newly_open_gates))
 
-    pushover_notify("Snowbasin update: something opened", "\n\n".join(parts))
+    telegram_notify("Snowbasin update: something opened", "\n\n".join(parts))
     print("Notification sent.")
 
 
