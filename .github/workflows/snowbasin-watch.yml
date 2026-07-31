@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "*/5 * * * *"   # GitHub minimum is every 5 minutes
   workflow_dispatch:
+    inputs:
+      test_notify:
+        description: "Send a test Telegram message instead of checking the mountain report"
+        type: boolean
+        default: false
 
 concurrency:
   group: snowbasin-watch
@@ -29,9 +34,10 @@ jobs:
 
       - name: Run watcher
         env:
-          PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
-          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           STATE_FILE: snowbasin_state.json
+          FORCE_TEST_NOTIFY: ${{ inputs.test_notify }}
         run: python snowbasin_watch.py
 
       - name: Commit updated state (only if changed)

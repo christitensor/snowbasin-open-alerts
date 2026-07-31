@@ -1,9 +1,5 @@
 {
   "gates": {},
-  "lifts": {
-    " :: ": "Closed"
-  },
-  "trails": {
-    " :: ": "Closed"
-  }
+  "lifts": {},
+  "trails": {}
 }

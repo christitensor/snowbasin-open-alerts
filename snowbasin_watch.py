@@ -1,7 +1,7 @@
 import json
 import os
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
@@ -9,8 +9,8 @@ from bs4 import BeautifulSoup
 URL = "https://www.snowbasin.com/the-mountain/mountain-report/"
 STATE_FILE = os.environ.get("STATE_FILE", "snowbasin_state.json")
 
-PUSHOVER_USER = os.environ.get("PUSHOVER_USER", "")
-PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # Make it look more like a browser (sometimes helps with anti-bot / alternate markup)
 USER_AGENT = os.environ.get(
@@ -19,26 +19,46 @@ USER_AGENT = os.environ.get(
 )
 DEBUG = os.environ.get("DEBUG", "0") == "1"
 
-LIFT_MARKERS = [
-    ("Open", "Lift Open"),
-    ("Closed", "Lift Closed"),
-    ("On Hold", "Lift On Hold"),
-    ("Scheduled", "Lift Scheduled"),
-    ("Delayed", "Lift Delayed"),
-]
-TRAIL_MARKERS = [
-    ("Open", "Trail Open"),
-    ("Closed", "Trail Closed"),
-    ("Expected", "Trail Expected"),
-    ("Delayed", "Trail Delayed"),
-]
+# The mountain report renders each lift/trail/gate as its own little card whose text,
+# once flattened, comes out as a run of separate lines: Name, then zero or more "extra"
+# lines (hours, lift type, a note like "Downhill biking only"), then a status line that
+# is one of the tokens below (nothing else on the page matches these exactly), then
+# sometimes a trailing "Suitable for ..." descriptor. The column layout has changed
+# between the summer and winter versions of the report (and may change again), but this
+# Name -> ... -> Status pattern is what both versions share, so we key off of it instead
+# of assuming a fixed number/order of columns.
+STATUS_TOKENS = {
+    "Lift Open": "lifts",
+    "Lift Closed": "lifts",
+    "Lift On Hold": "lifts",
+    "Lift Scheduled": "lifts",
+    "Lift Delayed": "lifts",
+    "Trail Open": "trails",
+    "Trail Closed": "trails",
+    "Trail Expected": "trails",
+    "Trail Delayed": "trails",
+    # Winter access gates have historically been rendered with the same markup as
+    # trails ("Trail Open"/"Trail Closed"); these "Gate ..." variants are kept as a
+    # fallback in case that changes.
+    "Gate Open": "gates",
+    "Gate Closed": "gates",
+    "Gate On Hold": "gates",
+    "Gate Scheduled": "gates",
+    "Gate Delayed": "gates",
+}
+
+# Column-header labels that show up as their own line in the flattened text; never
+# treat these as a lift/trail/gate name.
+HEADER_LABELS = {
+    "Lift Name", "Trail Name", "Gate Name", "Status", "Hours", "Lift Type", "Gate Type",
+}
 
 GATE_NAME_REGEX = re.compile(r".*\bGate$", re.IGNORECASE)
-GATE_SPECIAL_NAMES = {"The Wallow"}  # shows up in Access Gates list  [oai_citation:1‡Snowbasin Resort](https://www.snowbasin.com/the-mountain/mountain-report/)
+GATE_SPECIAL_NAMES = {"The Wallow"}  # historically shows up in the Access Gates list
 
 
 def normalize_text(s: str) -> str:
-    # Normalize non-breaking spaces and a couple other common “special spaces”
+    # Normalize non-breaking spaces and a couple other common "special spaces"
     s = s.replace("\xa0", " ").replace("\u2009", " ").replace("\u202f", " ")
     # Collapse whitespace
     s = re.sub(r"\s+", " ", s).strip()
@@ -64,45 +84,73 @@ def fetch_lines() -> List[str]:
     return [ln for ln in lines if ln]
 
 
-def parse_items_from_full_page(lines: List[str], kind: str) -> List[Tuple[str, str, str]]:
-    """
-    Returns list of (group, name, status) parsed from whole page.
-    Uses 'Toggle accordion' headers for grouping.  [oai_citation:2‡Snowbasin Resort](https://www.snowbasin.com/the-mountain/mountain-report/)
-    """
-    markers = LIFT_MARKERS if kind == "lifts" else TRAIL_MARKERS
-    items: List[Tuple[str, str, str]] = []
-
-    group = "Unknown"
-
-    for ln in lines:
-        if "Toggle accordion" in ln:
-            group = ln.replace("Toggle accordion", "").strip()
-            continue
-
-        found: Tuple[str, int, str] | None = None
-        for status, token in markers:
-            idx = ln.rfind(token)
-            if idx != -1 and (found is None or idx > found[1]):
-                found = (status, idx, token)
-
-        if not found:
-            continue
-
-        status, idx, token = found
-        name = ln[:idx].strip()
-        items.append((group, name, status))
-
-    return items
-
-
 def is_gate_row(group: str, name: str) -> bool:
     if GATE_NAME_REGEX.match(name):
         return True
     if name in GATE_SPECIAL_NAMES:
         return True
-    if "access gates" in group.lower():
+    if "gate" in group.lower():
         return True
     return False
+
+
+def parse_report(lines: List[str]) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
+    """
+    Walks the flattened page text and pulls out (lifts, trails, gates) dicts of
+    "{group} :: {name}" -> status.
+
+    Each accordion section on the page is preceded by a "Toggle accordion" line whose
+    header (the group name, e.g. "Lifts", "Trails", "Bike Park", "Access Gates") is the
+    line immediately before it. Within a section, entries appear as a run of lines
+    ending in one of STATUS_TOKENS; the first line of that run is the item's name.
+    """
+    lifts: Dict[str, str] = {}
+    trails: Dict[str, str] = {}
+    gates: Dict[str, str] = {}
+
+    group: Optional[str] = None
+    prev_line = ""
+    buffer: List[str] = []
+
+    for ln in lines:
+        if ln == "Toggle accordion":
+            group = prev_line
+            buffer = []
+            prev_line = ln
+            continue
+
+        prev_line = ln
+
+        if group is None:
+            continue
+
+        if ln in HEADER_LABELS:
+            continue
+
+        if ln.startswith("Suitable for"):
+            continue
+
+        token_kind = STATUS_TOKENS.get(ln)
+        if token_kind is None:
+            buffer.append(ln)
+            continue
+
+        if not buffer:
+            # A status line with no preceding name; nothing sensible to record.
+            continue
+
+        name = buffer[0]
+        buffer = []
+        key = f"{group} :: {name}"
+
+        if token_kind == "gates" or is_gate_row(group, name):
+            gates[key] = ln
+        elif token_kind == "lifts":
+            lifts[key] = ln
+        else:
+            trails[key] = ln
+
+    return lifts, trails, gates
 
 
 def load_state() -> Dict[str, Dict[str, str]]:
@@ -121,26 +169,36 @@ def save_state(state: Dict[str, Dict[str, str]]) -> None:
         json.dump(state, f, indent=2, sort_keys=True)
 
 
-def pushover_notify(title: str, message: str) -> None:
-    if not PUSHOVER_USER or not PUSHOVER_TOKEN:
-        print("Missing PUSHOVER_USER/PUSHOVER_TOKEN; skipping push.")
+def telegram_notify(title: str, message: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID; skipping notification.")
         print(title)
         print(message)
         return
 
-    resp = requests.post(
-        "https://api.pushover.net/1/messages.json",
-        timeout=20,
-        data={
-            "token": PUSHOVER_TOKEN,
-            "user": PUSHOVER_USER,
-            "title": title,
-            "message": message,
-            "url": URL,
-            "url_title": "Snowbasin Mountain Report",
-        },
-    )
-    resp.raise_for_status()
+    # TELEGRAM_CHAT_ID may be a single chat/group ID or a comma-separated list of them,
+    # so this one bot can notify a group chat and/or several individual chats.
+    chat_ids = [c.strip() for c in TELEGRAM_CHAT_ID.split(",") if c.strip()]
+    text = f"{title}\n\n{message}\n\n{URL}"
+
+    errors = []
+    for chat_id in chat_ids:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            timeout=20,
+            data={
+                "chat_id": chat_id,
+                "text": text,
+                "disable_web_page_preview": "true",
+            },
+        )
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            errors.append(f"{chat_id}: {e}")
+
+    if errors:
+        raise RuntimeError("Telegram send failed for: " + "; ".join(errors))
 
 
 def fmt(items: List[str], limit: int = 30) -> str:
@@ -153,38 +211,20 @@ def fmt(items: List[str], limit: int = 30) -> str:
 
 
 def main():
+    if os.environ.get("FORCE_TEST_NOTIFY", "").lower() in ("1", "true"):
+        telegram_notify(
+            "Snowbasin Watch: test",
+            "This is a manual test notification. If you got this, Telegram delivery is working.",
+        )
+        print("Test notification sent.")
+        return
+
     lines = fetch_lines()
 
-    # DEBUG: prove we’re seeing the “Lift …” and “Trail …” rows in GitHub Actions logs
+    lifts, trails, gates = parse_report(lines)
+
     if DEBUG:
-        lift_like = [ln for ln in lines if "Lift " in ln or " Lift" in ln][:12]
-        trail_like = [ln for ln in lines if "Trail " in ln or " Trail" in ln][:12]
         print(f"Total lines: {len(lines)}")
-        print("Sample lines containing 'Lift':")
-        for ln in lift_like:
-            print("  ", ln)
-        print("Sample lines containing 'Trail':")
-        for ln in trail_like:
-            print("  ", ln)
-
-    lift_items = parse_items_from_full_page(lines, "lifts")
-    trail_like_items = parse_items_from_full_page(lines, "trails")
-
-    lifts: Dict[str, str] = {}
-    trails: Dict[str, str] = {}
-    gates: Dict[str, str] = {}
-
-    for group, name, status in lift_items:
-        lifts[f"{group} :: {name}"] = status
-
-    for group, name, status in trail_like_items:
-        key = f"{group} :: {name}"
-        if is_gate_row(group, name):
-            gates[key] = status
-        else:
-            trails[key] = status
-
-    if DEBUG:
         print(f"Parsed lifts: {len(lifts)}")
         print(f"Parsed trails (excluding gates): {len(trails)}")
         print(f"Parsed gates: {len(gates)}")
@@ -197,13 +237,17 @@ def main():
     prev = load_state()
     first_run = (not prev["lifts"] and not prev["trails"] and not prev["gates"])
 
-    newly_open_lifts = sorted(k for k, v in lifts.items() if v == "Open" and prev["lifts"].get(k) != "Open")
-    newly_open_trails = sorted(k for k, v in trails.items() if v == "Open" and prev["trails"].get(k) != "Open")
-    newly_open_gates = sorted(k for k, v in gates.items() if v == "Open" and prev["gates"].get(k) != "Open")
+    newly_open_lifts = sorted(k for k, v in lifts.items() if v == "Lift Open" and prev["lifts"].get(k) != v)
+    newly_open_trails = sorted(k for k, v in trails.items() if v == "Trail Open" and prev["trails"].get(k) != v)
+    newly_open_gates = sorted(
+        k for k, v in gates.items()
+        if v in ("Gate Open", "Trail Open", "Lift Open") and prev["gates"].get(k) != v
+    )
 
     save_state(current)
 
-    # If everything is empty, that usually means the runner got a different “shell” page / blocked page.
+    # If everything is empty, that usually means the runner got a different "shell" page / blocked page,
+    # or the site's markup changed again and the parser needs another look.
     if len(lifts) == 0 and len(trails) == 0 and len(gates) == 0:
         raise RuntimeError("Parsing returned 0 lifts, 0 trails, and 0 gates — runner may be receiving different HTML.")
 
@@ -219,11 +263,11 @@ def main():
     if newly_open_lifts:
         parts.append("New lifts open:" + fmt(newly_open_lifts))
     if newly_open_trails:
-        parts.append("New trails open:" + fmt(newly_open_trails))
+        parts.append("New trails/runs open:" + fmt(newly_open_trails))
     if newly_open_gates:
         parts.append("New access gates open:" + fmt(newly_open_gates))
 
-    pushover_notify("Snowbasin update ✅ something opened", "\n\n".join(parts))
+    telegram_notify("Snowbasin update: something opened", "\n\n".join(parts))
     print("Notification sent.")
 
 
