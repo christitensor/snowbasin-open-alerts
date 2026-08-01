@@ -2,7 +2,7 @@
   "gates": {},
   "lifts": {
     "Lifts :: 9:00 AM \u2013 4:00 PM": "Lift Open",
-    "Lifts :: Needles Gondola": "Lift Open"
+    "Lifts :: Needles Gondola": "Lift Closed"
   },
   "trails": {
     "Bike Park :: Ridge Line": "Trail Open",
