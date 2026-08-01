@@ -56,6 +56,13 @@ HEADER_LABELS = {
 GATE_NAME_REGEX = re.compile(r".*\bGate$", re.IGNORECASE)
 GATE_SPECIAL_NAMES = {"The Wallow"}  # historically shows up in the Access Gates list
 
+# The lift table has a trailing "Hours" column (e.g. "9:00 AM – 4:00 PM") that renders
+# *after* the Status cell, so it lands in the buffer for the *next* item's name unless
+# skipped. It has no fixed prefix like "Suitable for", so match it by shape instead.
+HOUR_RANGE_REGEX = re.compile(
+    r"^\d{1,2}(:\d{2})?\s*[AaPp]\.?[Mm]\.?\s*[-–]\s*\d{1,2}(:\d{2})?\s*[AaPp]\.?[Mm]\.?$"
+)
+
 
 def normalize_text(s: str) -> str:
     # Normalize non-breaking spaces and a couple other common "special spaces"
@@ -130,6 +137,9 @@ def parse_report(lines: List[str]) -> Tuple[Dict[str, str], Dict[str, str], Dict
         if ln.startswith("Suitable for"):
             continue
 
+        if HOUR_RANGE_REGEX.match(ln):
+            continue
+
         token_kind = STATUS_TOKENS.get(ln)
         if token_kind is None:
             buffer.append(ln)
@@ -169,17 +179,15 @@ def save_state(state: Dict[str, Dict[str, str]]) -> None:
         json.dump(state, f, indent=2, sort_keys=True)
 
 
-def telegram_notify(title: str, message: str) -> None:
+def telegram_notify(text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID; skipping notification.")
-        print(title)
-        print(message)
+        print(text)
         return
 
     # TELEGRAM_CHAT_ID may be a single chat/group ID or a comma-separated list of them,
     # so this one bot can notify a group chat and/or several individual chats.
     chat_ids = [c.strip() for c in TELEGRAM_CHAT_ID.split(",") if c.strip()]
-    text = f"{title}\n\n{message}\n\n{URL}"
 
     errors = []
     for chat_id in chat_ids:
@@ -201,21 +209,39 @@ def telegram_notify(title: str, message: str) -> None:
         raise RuntimeError("Telegram send failed for: " + "; ".join(errors))
 
 
-def fmt(items: List[str], limit: int = 30) -> str:
-    shown = items[:limit]
-    more = len(items) - len(shown)
-    msg = "\n- " + "\n- ".join(shown) if shown else ""
-    if more > 0:
-        msg += f"\n(+{more} more)"
-    return msg
+def display_name(key: str) -> str:
+    return key.split(" :: ", 1)[-1]
+
+
+# Above this many newly-opened items, naming each one gets too long to glance at or
+# have read aloud, so switch to a count-per-category summary instead.
+MAX_NAMED_ITEMS = 6
+
+
+def build_notification_text(newly_open_lifts: List[str], newly_open_trails: List[str], newly_open_gates: List[str]) -> str:
+    total = len(newly_open_lifts) + len(newly_open_trails) + len(newly_open_gates)
+    if total <= MAX_NAMED_ITEMS:
+        names = [display_name(k) for k in newly_open_lifts + newly_open_trails + newly_open_gates]
+        return "Open: " + ", ".join(names)
+
+    def count_label(items: List[str], noun: str) -> Optional[str]:
+        if not items:
+            return None
+        return f"{len(items)} {noun}{'s' if len(items) != 1 else ''}"
+
+    counts = [
+        c for c in (
+            count_label(newly_open_lifts, "lift"),
+            count_label(newly_open_trails, "trail"),
+            count_label(newly_open_gates, "gate"),
+        ) if c
+    ]
+    return "Open: " + ", ".join(counts)
 
 
 def main():
     if os.environ.get("FORCE_TEST_NOTIFY", "").lower() in ("1", "true"):
-        telegram_notify(
-            "Snowbasin Watch: test",
-            "This is a manual test notification. If you got this, Telegram delivery is working.",
-        )
+        telegram_notify("Snowbasin test ✅")
         print("Test notification sent.")
         return
 
@@ -259,15 +285,7 @@ def main():
         print("No new opens.")
         return
 
-    parts = []
-    if newly_open_lifts:
-        parts.append("New lifts open:" + fmt(newly_open_lifts))
-    if newly_open_trails:
-        parts.append("New trails/runs open:" + fmt(newly_open_trails))
-    if newly_open_gates:
-        parts.append("New access gates open:" + fmt(newly_open_gates))
-
-    telegram_notify("Snowbasin update: something opened", "\n\n".join(parts))
+    telegram_notify(build_notification_text(newly_open_lifts, newly_open_trails, newly_open_gates))
     print("Notification sent.")
 
 
