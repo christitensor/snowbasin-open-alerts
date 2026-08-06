@@ -45,7 +45,7 @@ jobs:
           git config user.name "snowbasin-watch-bot"
           git config user.email "actions@users.noreply.github.com"
           if ! git diff --quiet; then
-            git add snowbasin_state.json
+            git add snowbasin_state.json bot_config.json
             git commit -m "Update Snowbasin state"
             git push
           fi

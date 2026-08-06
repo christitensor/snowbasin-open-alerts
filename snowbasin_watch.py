@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -8,9 +9,18 @@ from bs4 import BeautifulSoup
 
 URL = "https://www.snowbasin.com/the-mountain/mountain-report/"
 STATE_FILE = os.environ.get("STATE_FILE", "snowbasin_state.json")
+BOT_CONFIG_FILE = os.environ.get("BOT_CONFIG_FILE", "bot_config.json")
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# The external pinger calls this workflow every minute (the finest cadence we support);
+# the actual "is it time for a real check yet" decision happens here, driven by
+# bot_config.json's interval_minutes, which anyone in the chat can change by texting
+# the bot. This keeps the pinger dumb and fixed while frequency stays user-adjustable.
+DEFAULT_INTERVAL_MINUTES = 5
+MIN_INTERVAL_MINUTES = 1
+MAX_INTERVAL_MINUTES = 12 * 60  # "twice daily"
 
 # Make it look more like a browser (sometimes helps with anti-bot / alternate markup)
 USER_AGENT = os.environ.get(
@@ -179,18 +189,20 @@ def save_state(state: Dict[str, Dict[str, str]]) -> None:
         json.dump(state, f, indent=2, sort_keys=True)
 
 
-def telegram_notify(text: str) -> None:
+def configured_chat_ids() -> List[str]:
+    # TELEGRAM_CHAT_ID may be a single chat/group ID or a comma-separated list of them,
+    # so this one bot can notify a group chat and/or several individual chats.
+    return [c.strip() for c in TELEGRAM_CHAT_ID.split(",") if c.strip()]
+
+
+def telegram_notify(text: str, chat_ids: Optional[List[str]] = None) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID; skipping notification.")
         print(text)
         return
 
-    # TELEGRAM_CHAT_ID may be a single chat/group ID or a comma-separated list of them,
-    # so this one bot can notify a group chat and/or several individual chats.
-    chat_ids = [c.strip() for c in TELEGRAM_CHAT_ID.split(",") if c.strip()]
-
     errors = []
-    for chat_id in chat_ids:
+    for chat_id in chat_ids if chat_ids is not None else configured_chat_ids():
         resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             timeout=20,
@@ -207,6 +219,107 @@ def telegram_notify(text: str) -> None:
 
     if errors:
         raise RuntimeError("Telegram send failed for: " + "; ".join(errors))
+
+
+def load_bot_config() -> Dict:
+    cfg = {"interval_minutes": DEFAULT_INTERVAL_MINUTES, "last_checked": None, "last_update_id": 0}
+    if os.path.exists(BOT_CONFIG_FILE):
+        with open(BOT_CONFIG_FILE, "r", encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    return cfg
+
+
+def save_bot_config(cfg: Dict) -> None:
+    with open(BOT_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True)
+
+
+def telegram_get_updates(offset: int) -> List[Dict]:
+    if not TELEGRAM_BOT_TOKEN:
+        return []
+    resp = requests.get(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+        params={"offset": offset, "timeout": 0},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.json().get("result", [])
+
+
+FREQ_COMMAND_REGEX = re.compile(r"^/freq(?:uency)?(?:@\w+)?\s*(.*)$", re.IGNORECASE)
+TWICE_DAILY_REGEX = re.compile(r"twice\s*(a\s*)?day|twice\s*daily", re.IGNORECASE)
+
+
+def parse_frequency_minutes(text: str) -> Optional[int]:
+    """Returns a clamped interval in minutes, or None if `text` doesn't ask for one."""
+    t = text.strip()
+    m = FREQ_COMMAND_REGEX.match(t)
+    arg = m.group(1).strip() if m else t
+    if not arg:
+        return None
+    if TWICE_DAILY_REGEX.search(arg):
+        return MAX_INTERVAL_MINUTES
+    if re.search(r"\bevery\s*minute\b", arg, re.IGNORECASE):
+        return MIN_INTERVAL_MINUTES
+    num_m = re.search(r"\d+", arg)
+    if num_m:
+        return max(MIN_INTERVAL_MINUTES, min(MAX_INTERVAL_MINUTES, int(num_m.group())))
+    return None
+
+
+def process_telegram_commands(cfg: Dict) -> Dict:
+    """
+    Polls Telegram for new messages since the last processed update, honors any
+    /freq commands from chats we're configured to notify, and replies. Always
+    advances last_update_id so we never reprocess the same message twice, even
+    for messages we ignore (wrong chat, unrecognized text).
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return cfg
+
+    allowed = set(configured_chat_ids())
+
+    try:
+        updates = telegram_get_updates(cfg.get("last_update_id", 0) + 1)
+    except requests.RequestException as e:
+        print(f"Telegram getUpdates failed, skipping command check this run: {e}")
+        return cfg
+
+    for update in updates:
+        cfg["last_update_id"] = update["update_id"]
+
+        message = update.get("message") or update.get("edited_message")
+        if not message or "text" not in message:
+            continue
+
+        chat_id = str(message["chat"]["id"])
+        if chat_id not in allowed:
+            continue
+
+        text = message["text"]
+        if not FREQ_COMMAND_REGEX.match(text) and "twice" not in text.lower() and "every" not in text.lower():
+            continue
+
+        m = FREQ_COMMAND_REGEX.match(text)
+        arg = (m.group(1).strip() if m else text.strip())
+
+        if m and not arg:
+            telegram_notify(f"Checking every {cfg['interval_minutes']} min.", chat_ids=[chat_id])
+            continue
+
+        minutes = parse_frequency_minutes(arg)
+        if minutes is None:
+            telegram_notify(
+                f"Didn't catch that. Send /freq <1-{MAX_INTERVAL_MINUTES}> (minutes) or /freq twice daily. "
+                f"Currently every {cfg['interval_minutes']} min.",
+                chat_ids=[chat_id],
+            )
+            continue
+
+        cfg["interval_minutes"] = minutes
+        telegram_notify(f"Checking every {minutes} min.", chat_ids=[chat_id])
+
+    return cfg
 
 
 def display_name(key: str) -> str:
@@ -243,6 +356,25 @@ def main():
     if os.environ.get("FORCE_TEST_NOTIFY", "").lower() in ("1", "true"):
         telegram_notify("Snowbasin test ✅")
         print("Test notification sent.")
+        return
+
+    # The external pinger fires this every minute regardless; commands need to be
+    # checked every time so replies feel prompt, even on runs that end up skipping
+    # the actual mountain-report fetch below.
+    bot_cfg = process_telegram_commands(load_bot_config())
+
+    now = time.time()
+    last_checked = bot_cfg.get("last_checked")
+    interval_minutes = bot_cfg.get("interval_minutes", DEFAULT_INTERVAL_MINUTES)
+    due = last_checked is None or (now - last_checked) / 60 >= interval_minutes
+
+    if due:
+        bot_cfg["last_checked"] = now
+    save_bot_config(bot_cfg)
+
+    if not due:
+        elapsed = (now - last_checked) / 60
+        print(f"Not due yet ({elapsed:.1f} of {interval_minutes} min); skipping mountain report check.")
         return
 
     lines = fetch_lines()
