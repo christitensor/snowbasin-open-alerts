@@ -20,7 +20,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 # the bot. This keeps the pinger dumb and fixed while frequency stays user-adjustable.
 DEFAULT_INTERVAL_MINUTES = 5
 MIN_INTERVAL_MINUTES = 1
-MAX_INTERVAL_MINUTES = 12 * 60  # "twice daily"
+TWICE_DAILY_MINUTES = 12 * 60
+MAX_INTERVAL_MINUTES = 24 * 60  # "daily", the loosest setting we support
 
 # Make it look more like a browser (sometimes helps with anti-bot / alternate markup)
 USER_AGENT = os.environ.get(
@@ -248,6 +249,7 @@ def telegram_get_updates(offset: int) -> List[Dict]:
 
 FREQ_COMMAND_REGEX = re.compile(r"^/freq(?:uency)?(?:@\w+)?\s*(.*)$", re.IGNORECASE)
 TWICE_DAILY_REGEX = re.compile(r"twice\s*(a\s*)?day|twice\s*daily", re.IGNORECASE)
+DAILY_REGEX = re.compile(r"\bdaily\b|\bonce\s*(a\s*)?day\b", re.IGNORECASE)
 
 
 def parse_frequency_minutes(text: str) -> Optional[int]:
@@ -257,7 +259,10 @@ def parse_frequency_minutes(text: str) -> Optional[int]:
     arg = m.group(1).strip() if m else t
     if not arg:
         return None
+    # Check "twice daily" before plain "daily" since the latter matches the former's text too.
     if TWICE_DAILY_REGEX.search(arg):
+        return TWICE_DAILY_MINUTES
+    if DAILY_REGEX.search(arg):
         return MAX_INTERVAL_MINUTES
     if re.search(r"\bevery\s*minute\b", arg, re.IGNORECASE):
         return MIN_INTERVAL_MINUTES
@@ -297,7 +302,8 @@ def process_telegram_commands(cfg: Dict) -> Dict:
             continue
 
         text = message["text"]
-        if not FREQ_COMMAND_REGEX.match(text) and "twice" not in text.lower() and "every" not in text.lower():
+        lowered = text.lower()
+        if not FREQ_COMMAND_REGEX.match(text) and not any(w in lowered for w in ("twice", "daily", "every")):
             continue
 
         m = FREQ_COMMAND_REGEX.match(text)
@@ -310,8 +316,8 @@ def process_telegram_commands(cfg: Dict) -> Dict:
         minutes = parse_frequency_minutes(arg)
         if minutes is None:
             telegram_notify(
-                f"Didn't catch that. Send /freq <1-{MAX_INTERVAL_MINUTES}> (minutes) or /freq twice daily. "
-                f"Currently every {cfg['interval_minutes']} min.",
+                f"Didn't catch that. Send /freq <1-{MAX_INTERVAL_MINUTES}> (minutes), /freq daily, or "
+                f"/freq twice daily. Currently every {cfg['interval_minutes']} min.",
                 chat_ids=[chat_id],
             )
             continue
