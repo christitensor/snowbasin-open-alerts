@@ -44,8 +44,30 @@ jobs:
         run: |
           git config user.name "snowbasin-watch-bot"
           git config user.email "actions@users.noreply.github.com"
-          if ! git diff --quiet; then
+
+          if git diff --quiet; then
+            exit 0
+          fi
+
+          git add snowbasin_state.json bot_config.json
+          git commit -m "Update Snowbasin state"
+
+          # With the external pinger firing every minute, two runs can occasionally
+          # overlap and both try to push a state update, so the second push gets
+          # rejected as non-fast-forward. Our working tree already holds this run's
+          # final (freshly re-fetched) state, so on a rejection we just re-parent
+          # that same commit onto whatever is now on origin/main and try again,
+          # rather than attempting a real content merge.
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt/5), retrying..."
+            git fetch origin main
+            git reset --mixed origin/main
             git add snowbasin_state.json bot_config.json
             git commit -m "Update Snowbasin state"
-            git push
-          fi
+          done
+
+          echo "::error::Failed to push updated state after 5 attempts"
+          exit 1
