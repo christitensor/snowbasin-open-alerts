@@ -1,14 +1,14 @@
 {
   "gates": {},
   "lifts": {
-    "Lifts :: Littlecat Express": "Lift Closed",
-    "Lifts :: Needles Gondola": "Lift Closed"
+    "Lifts :: Littlecat Express": "Lift Open",
+    "Lifts :: Needles Gondola": "Lift Open"
   },
   "trails": {
-    "Bike Park :: Ridge Line": "Trail Closed",
-    "Bike Park :: Roll Out": "Trail Closed",
-    "Bike Park :: Scratch That": "Trail Closed",
-    "Bike Park :: Squirrel": "Trail Closed",
+    "Bike Park :: Ridge Line": "Trail Open",
+    "Bike Park :: Roll Out": "Trail Open",
+    "Bike Park :: Scratch That": "Trail Open",
+    "Bike Park :: Squirrel": "Trail Open",
     "Trails :: Becker": "Trail Closed",
     "Trails :: Canyon Rim Trail": "Trail Open",
     "Trails :: Chicken Spur": "Trail Open",
