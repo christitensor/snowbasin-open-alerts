@@ -1,8 +1,8 @@
 {
   "gates": {},
   "lifts": {
-    "Lifts :: Littlecat Express": "Lift Open",
-    "Lifts :: Needles Gondola": "Lift Open"
+    "Lifts :: Littlecat Express": "Lift Closed",
+    "Lifts :: Needles Gondola": "Lift Closed"
   },
   "trails": {
     "Bike Park :: Ridge Line": "Trail Closed",
@@ -11,14 +11,14 @@
     "Bike Park :: Squirrel": "Trail Closed",
     "Trails :: Becker": "Trail Closed",
     "Trails :: Canyon Rim Trail": "Trail Open",
-    "Trails :: Chicken Spur": "Trail Open",
+    "Trails :: Chicken Spur": "Trail Closed",
     "Trails :: Cirque Loop": "Trail Open",
     "Trails :: Diamond": "Trail Closed",
-    "Trails :: Green Pond": "Trail Open",
+    "Trails :: Green Pond": "Trail Closed",
     "Trails :: Inner Moose Loop": "Trail Open",
     "Trails :: John Paul Trail": "Trail Open",
     "Trails :: Last Chance": "Trail Open",
-    "Trails :: Maples": "Trail Open",
+    "Trails :: Maples": "Trail Closed",
     "Trails :: Middle Bowl": "Trail Open",
     "Trails :: Moonshine Trees": "Trail Open",
     "Trails :: Needles (Lower)": "Trail Open",
@@ -27,7 +27,7 @@
     "Trails :: Outer Moose Loop": "Trail Open",
     "Trails :: Porcupine": "Trail Closed",
     "Trails :: Ridge Trail": "Trail Open",
-    "Trails :: Snowbasin Trail": "Trail Open",
+    "Trails :: Snowbasin Trail": "Trail Closed",
     "Trails :: Strawberry Trail": "Trail Open",
     "Trails :: Summer Road": "Trail Open",
     "Trails :: Sunshine": "Trail Open"
