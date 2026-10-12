@@ -83,7 +83,7 @@ def normalize_text(s: str) -> str:
     return s
 
 
-def fetch_lines() -> List[str]:
+def fetch_lines() -> Tuple[List[str], str]:
     r = requests.get(
         URL,
         headers={
@@ -96,10 +96,34 @@ def fetch_lines() -> List[str]:
     r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "html.parser")
+    raw_html = r.text
     text = soup.get_text("\n")
     text = text.replace("\xa0", " ")  # important: normalize before splitting/regex
     lines = [normalize_text(ln) for ln in text.splitlines()]
-    return [ln for ln in lines if ln]
+    return [ln for ln in lines if ln], raw_html
+
+
+def print_diagnostics(lines: List[str], raw_html: str) -> None:
+    # Printed only when parsing comes back empty, so the next time the site changes the
+    # Actions log shows exactly what the runner received instead of just "0 parsed".
+    soup = BeautifulSoup(raw_html, "html.parser")
+    title = soup.title.get_text(strip=True) if soup.title else "(no <title>)"
+    print("---- parse diagnostics ----")
+    print(f"HTML length: {len(raw_html)}  text lines: {len(lines)}  title: {title!r}")
+    for marker in ["Toggle accordion", "Lift Open", "Lift Closed", "Trail Open", "Trail Closed",
+                   "Needles Gondola", "Littlecat", "cf-challenge", "Just a moment", "captcha"]:
+        print(f"  {marker!r}: text={sum(marker in ln for ln in lines)} html={raw_html.count(marker)}")
+    for i, ln in enumerate(lines):
+        if ln in ("Lifts", "Trails") or "Needles Gondola" in ln or "Toggle" in ln:
+            print(f"  context around line {i}:")
+            for j in range(max(0, i - 4), min(len(lines), i + 12)):
+                print(f"    {j}: {ln if j == i else lines[j]!r}"[:200])
+            break
+    idx = raw_html.find("Needles Gondola")
+    if idx != -1:
+        print("  raw HTML around 'Needles Gondola':")
+        print(raw_html[max(0, idx - 1500): idx + 1500])
+    print("---------------------------")
 
 
 def is_gate_row(group: str, name: str) -> bool:
@@ -358,6 +382,16 @@ def build_notification_text(newly_open_lifts: List[str], newly_open_trails: List
     return "Open: " + ", ".join(counts)
 
 
+def report_problem(bot_cfg: Dict, problem: str) -> None:
+    # Logged as a GitHub warning (visible in the run, but the run still succeeds) and sent
+    # to Telegram only once per outage, so a broken site can't spam anyone.
+    print(f"::warning::Snowbasin check skipped: {problem}")
+    if not bot_cfg.get("problem_reported"):
+        bot_cfg["problem_reported"] = True
+        save_bot_config(bot_cfg)
+        telegram_notify(f"⚠️ Snowbasin watcher: {problem}. I'll keep trying and let you know when it's working again.")
+
+
 def main():
     if os.environ.get("FORCE_TEST_NOTIFY", "").lower() in ("1", "true"):
         telegram_notify("Snowbasin test ✅")
@@ -383,7 +417,15 @@ def main():
         print(f"Not due yet ({elapsed:.1f} of {interval_minutes} min); skipping mountain report check.")
         return
 
-    lines = fetch_lines()
+    # From here on, a failure must not crash the job: the commit step only runs after a
+    # clean exit, so a crash would leave last_checked unsaved, the next minute's ping
+    # would consider the check due again, and every run would fail (one GitHub email
+    # per minute). Instead, warn the chat once and exit cleanly so last_checked sticks.
+    try:
+        lines, raw_html = fetch_lines()
+    except requests.RequestException as e:
+        report_problem(bot_cfg, f"couldn't load the mountain report ({e.__class__.__name__})")
+        return
 
     lifts, trails, gates = parse_report(lines)
 
@@ -395,6 +437,18 @@ def main():
         print("Sample parsed lifts:", list(lifts.items())[:5])
         print("Sample parsed trails:", list(trails.items())[:5])
         print("Sample parsed gates:", list(gates.items())[:10])
+
+    # If everything is empty, that usually means the runner got a different "shell" page / blocked page,
+    # or the site's markup changed again and the parser needs another look. Keep the previous state
+    # untouched so we don't fire a flood of "now open" alerts once parsing works again.
+    if len(lifts) == 0 and len(trails) == 0 and len(gates) == 0:
+        print_diagnostics(lines, raw_html)
+        report_problem(bot_cfg, "the mountain report page loaded but no lifts/trails could be read (site layout may have changed)")
+        return
+
+    if bot_cfg.pop("problem_reported", None):
+        save_bot_config(bot_cfg)
+        telegram_notify("Snowbasin watcher is reading the mountain report again ✅")
 
     current = {"lifts": lifts, "trails": trails, "gates": gates}
 
@@ -409,11 +463,6 @@ def main():
     )
 
     save_state(current)
-
-    # If everything is empty, that usually means the runner got a different "shell" page / blocked page,
-    # or the site's markup changed again and the parser needs another look.
-    if len(lifts) == 0 and len(trails) == 0 and len(gates) == 0:
-        raise RuntimeError("Parsing returned 0 lifts, 0 trails, and 0 gates — runner may be receiving different HTML.")
 
     if first_run:
         print("Initialized state; no notification on first run.")
