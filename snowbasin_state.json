@@ -2,7 +2,7 @@
   "gates": {},
   "lifts": {
     "Lifts :: Littlecat Express": "Lift Closed",
-    "Lifts :: Needles Gondola": "Lift Closed"
+    "Lifts :: Needles Gondola": "Lift Open"
   },
   "trails": {
     "Bike Park :: Ridge Line": "Trail Closed",
