@@ -226,24 +226,44 @@ def telegram_notify(text: str, chat_ids: Optional[List[str]] = None) -> None:
         print(text)
         return
 
+    targets = chat_ids if chat_ids is not None else configured_chat_ids()
     errors = []
-    for chat_id in chat_ids if chat_ids is not None else configured_chat_ids():
-        resp = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            timeout=20,
-            data={
-                "chat_id": chat_id,
-                "text": text,
-                "disable_web_page_preview": "true",
-            },
-        )
+    for chat_id in targets:
         try:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                timeout=20,
+                data={
+                    "chat_id": chat_id,
+                    "text": text,
+                    "disable_web_page_preview": "true",
+                },
+            )
             resp.raise_for_status()
-        except requests.HTTPError as e:
-            errors.append(f"{chat_id}: {e}")
+        except requests.RequestException as e:
+            # Report only the exception class: requests' messages embed the request URL,
+            # which contains the bot token.
+            status = f" {e.response.status_code}" if e.response is not None else ""
+            errors.append(f"{chat_id}: {e.__class__.__name__}{status}")
 
-    if errors:
-        raise RuntimeError("Telegram send failed for: " + "; ".join(errors))
+    if not errors:
+        return
+    if len(errors) < len(targets):
+        # At least one chat got the message. Raising here would fail the run before the
+        # new state is committed, so the next run would re-send the same alert to the
+        # chats that already received it (every minute, if one chat is permanently broken).
+        print("::warning::Telegram send failed for: " + "; ".join(errors))
+        return
+    raise RuntimeError("Telegram send failed for: " + "; ".join(errors))
+
+
+def safe_notify(text: str, chat_ids: Optional[List[str]] = None) -> None:
+    # For best-effort messages (command replies, outage notices) whose failure must not
+    # crash the run and block saving last_update_id / last_checked / problem_reported.
+    try:
+        telegram_notify(text, chat_ids=chat_ids)
+    except (requests.RequestException, RuntimeError) as e:
+        print(f"::warning::Telegram notification failed: {e}")
 
 
 def load_bot_config() -> Dict:
@@ -311,7 +331,8 @@ def process_telegram_commands(cfg: Dict) -> Dict:
     try:
         updates = telegram_get_updates(cfg.get("last_update_id", 0) + 1)
     except requests.RequestException as e:
-        print(f"Telegram getUpdates failed, skipping command check this run: {e}")
+        # Class name only: the exception text embeds the request URL, which contains the bot token.
+        print(f"Telegram getUpdates failed, skipping command check this run: {e.__class__.__name__}")
         return cfg
 
     for update in updates:
@@ -334,12 +355,12 @@ def process_telegram_commands(cfg: Dict) -> Dict:
         arg = (m.group(1).strip() if m else text.strip())
 
         if m and not arg:
-            telegram_notify(f"Checking every {cfg['interval_minutes']} min.", chat_ids=[chat_id])
+            safe_notify(f"Checking every {cfg['interval_minutes']} min.", chat_ids=[chat_id])
             continue
 
         minutes = parse_frequency_minutes(arg)
         if minutes is None:
-            telegram_notify(
+            safe_notify(
                 f"Didn't catch that. Send /freq <1-{MAX_INTERVAL_MINUTES}> (minutes), /freq daily, or "
                 f"/freq twice daily. Currently every {cfg['interval_minutes']} min.",
                 chat_ids=[chat_id],
@@ -347,7 +368,7 @@ def process_telegram_commands(cfg: Dict) -> Dict:
             continue
 
         cfg["interval_minutes"] = minutes
-        telegram_notify(f"Checking every {minutes} min.", chat_ids=[chat_id])
+        safe_notify(f"Checking every {minutes} min.", chat_ids=[chat_id])
 
     return cfg
 
@@ -389,7 +410,7 @@ def report_problem(bot_cfg: Dict, problem: str) -> None:
     if not bot_cfg.get("problem_reported"):
         bot_cfg["problem_reported"] = True
         save_bot_config(bot_cfg)
-        telegram_notify(f"⚠️ Snowbasin watcher: {problem}. I'll keep trying and let you know when it's working again.")
+        safe_notify(f"⚠️ Snowbasin watcher: {problem}. I'll keep trying and let you know when it's working again.")
 
 
 def main():
@@ -448,7 +469,7 @@ def main():
 
     if bot_cfg.pop("problem_reported", None):
         save_bot_config(bot_cfg)
-        telegram_notify("Snowbasin watcher is reading the mountain report again ✅")
+        safe_notify("Snowbasin watcher is reading the mountain report again ✅")
 
     current = {"lifts": lifts, "trails": trails, "gates": gates}
 
