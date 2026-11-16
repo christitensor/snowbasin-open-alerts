@@ -12,7 +12,9 @@ on:
 
 concurrency:
   group: snowbasin-watch
-  cancel-in-progress: true
+  # Don't cancel a run mid-way: one that has already sent an alert but not yet pushed
+  # its state would be killed, and the next run would re-send the same alert.
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -22,15 +24,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Check out the branch tip at run time, not the SHA from when this run was
+          # queued: a queued run would otherwise start from state older than what the
+          # previous run just pushed and re-send its alerts.
+          ref: ${{ github.ref_name }}
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+        # requirements.txt is fully pinned with hashes (generated from requirements.in;
+        # see the header of requirements.txt for the command to regenerate it).
+        run: pip install --require-hashes -r requirements.txt
 
       - name: Run watcher
         env:
@@ -41,6 +48,10 @@ jobs:
         run: python snowbasin_watch.py
 
       - name: Commit updated state (only if changed)
+        # Also runs when the watcher step failed (e.g. every Telegram send failed): the run
+        # still shows as failed, but the state it already saved gets committed, so the
+        # next ping doesn't re-detect and re-send the same alert every minute.
+        if: ${{ !cancelled() }}
         run: |
           git config user.name "snowbasin-watch-bot"
           git config user.email "actions@users.noreply.github.com"
@@ -66,6 +77,9 @@ jobs:
             git fetch origin main
             git reset --mixed origin/main
             git add snowbasin_state.json bot_config.json
+            if git diff --cached --quiet; then
+              exit 0  # origin/main already has identical state
+            fi
             git commit -m "Update Snowbasin state"
           done
 

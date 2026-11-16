@@ -16,8 +16,11 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # The external pinger calls this workflow every minute (the finest cadence we support);
 # the actual "is it time for a real check yet" decision happens here, driven by
-# bot_config.json's interval_minutes, which anyone in the chat can change by texting
-# the bot. This keeps the pinger dumb and fixed while frequency stays user-adjustable.
+# bot_config.json's interval_minutes, which anyone in the chat can change with the
+# /freq command (e.g. "/freq 30", "/freq daily", "/freq twice daily"; "/frequency" is an
+# accepted alias). Ordinary chat messages are ignored, even ones that happen to contain
+# words like "every" or "daily". This keeps the pinger dumb and fixed while frequency
+# stays user-adjustable.
 DEFAULT_INTERVAL_MINUTES = 5
 MIN_INTERVAL_MINUTES = 1
 TWICE_DAILY_MINUTES = 12 * 60
@@ -29,6 +32,9 @@ USER_AGENT = os.environ.get(
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
 DEBUG = os.environ.get("DEBUG", "0") == "1"
+
+# State keys are "{group} :: {name}" as parsed; see stable_keys() for what is persisted.
+KEY_SEP = " :: "
 
 # The mountain report renders each lift/trail/gate as its own little card whose text,
 # once flattened, comes out as a run of separate lines: Name, then zero or more "extra"
@@ -139,7 +145,8 @@ def is_gate_row(group: str, name: str) -> bool:
 def parse_report(lines: List[str]) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
     """
     Walks the flattened page text and pulls out (lifts, trails, gates) dicts of
-    "{group} :: {name}" -> status.
+    "{group} :: {name}" -> status. Callers should pass each dict through stable_keys()
+    before comparing against saved state.
 
     Each accordion section on the page is preceded by a "Toggle accordion" line whose
     header (the group name, e.g. "Lifts", "Trails", "Bike Park", "Access Gates") is the
@@ -186,7 +193,7 @@ def parse_report(lines: List[str]) -> Tuple[Dict[str, str], Dict[str, str], Dict
 
         name = buffer[0]
         buffer = []
-        key = f"{group} :: {name}"
+        key = f"{group}{KEY_SEP}{name}"
 
         if token_kind == "gates" or is_gate_row(group, name):
             gates[key] = ln
@@ -198,20 +205,64 @@ def parse_report(lines: List[str]) -> Tuple[Dict[str, str], Dict[str, str], Dict
     return lifts, trails, gates
 
 
+def stable_keys(items: Dict[str, str]) -> Dict[str, str]:
+    """
+    Re-keys one category's {"{group} :: {name}": status} dict by item name alone, so
+    that renaming an accordion section on the site (e.g. "Lifts" -> "Chairlifts") doesn't
+    make every item look new and re-alert. Only names that appear in more than one section
+    of the same category (e.g. a "Groomed" row under both "Needles" and "Porcupine") keep
+    the "{group} :: " prefix, since the name alone wouldn't tell them apart.
+
+    Idempotent, so it also migrates state saved by older versions (which keyed every item
+    by "{group} :: {name}") on load.
+    """
+    names: Dict[str, int] = {}
+    for key in items:
+        name = display_name(key)
+        names[name] = names.get(name, 0) + 1
+    out: Dict[str, str] = {}
+    for key, status in items.items():
+        name = display_name(key)
+        out[name if names[name] == 1 else key] = status
+    return out
+
+
+def previous_status(prev_items: Dict[str, str], key: str) -> Optional[str]:
+    """
+    Looks up `key`'s saved status, falling back to a match by item name alone when the
+    exact key is missing and every saved item with that name has the same status. This
+    covers an item switching between the plain-name and "{group} :: {name}" forms (a
+    duplicate name appearing on or disappearing from the page), and a duplicate-named
+    item whose section was renamed, without re-alerting it.
+    """
+    if key in prev_items:
+        return prev_items[key]
+    name = display_name(key)
+    statuses = {v for k, v in prev_items.items() if display_name(k) == name}
+    return statuses.pop() if len(statuses) == 1 else None
+
+
 def load_state() -> Dict[str, Dict[str, str]]:
     if not os.path.exists(STATE_FILE):
         return {"lifts": {}, "trails": {}, "gates": {}}
     with open(STATE_FILE, "r", encoding="utf-8") as f:
         state = json.load(f)
-    state.setdefault("lifts", {})
-    state.setdefault("trails", {})
-    state.setdefault("gates", {})
+    for category in ("lifts", "trails", "gates"):
+        state[category] = stable_keys(state.get(category, {}))
     return state
 
 
+def write_json_atomic(path: str, data: Dict) -> None:
+    # Write-then-rename so a crash mid-write can never leave a truncated file behind for
+    # the workflow's commit step to push.
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
 def save_state(state: Dict[str, Dict[str, str]]) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, sort_keys=True)
+    write_json_atomic(STATE_FILE, state)
 
 
 def configured_chat_ids() -> List[str]:
@@ -226,24 +277,44 @@ def telegram_notify(text: str, chat_ids: Optional[List[str]] = None) -> None:
         print(text)
         return
 
+    targets = chat_ids if chat_ids is not None else configured_chat_ids()
     errors = []
-    for chat_id in chat_ids if chat_ids is not None else configured_chat_ids():
-        resp = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            timeout=20,
-            data={
-                "chat_id": chat_id,
-                "text": text,
-                "disable_web_page_preview": "true",
-            },
-        )
+    for chat_id in targets:
         try:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                timeout=20,
+                data={
+                    "chat_id": chat_id,
+                    "text": text,
+                    "disable_web_page_preview": "true",
+                },
+            )
             resp.raise_for_status()
-        except requests.HTTPError as e:
-            errors.append(f"{chat_id}: {e}")
+        except requests.RequestException as e:
+            # Report only the exception class: requests' messages embed the request URL,
+            # which contains the bot token.
+            status = f" {e.response.status_code}" if e.response is not None else ""
+            errors.append(f"{chat_id}: {e.__class__.__name__}{status}")
 
-    if errors:
-        raise RuntimeError("Telegram send failed for: " + "; ".join(errors))
+    if not errors:
+        return
+    if len(errors) < len(targets):
+        # At least one chat got the message. Raising here would fail the run before the
+        # new state is committed, so the next run would re-send the same alert to the
+        # chats that already received it (every minute, if one chat is permanently broken).
+        print("::warning::Telegram send failed for: " + "; ".join(errors))
+        return
+    raise RuntimeError("Telegram send failed for: " + "; ".join(errors))
+
+
+def safe_notify(text: str, chat_ids: Optional[List[str]] = None) -> None:
+    # For best-effort messages (command replies, outage notices) whose failure must not
+    # crash the run and block saving last_update_id / last_checked / problem_reported.
+    try:
+        telegram_notify(text, chat_ids=chat_ids)
+    except (requests.RequestException, RuntimeError) as e:
+        print(f"::warning::Telegram notification failed: {e}")
 
 
 def load_bot_config() -> Dict:
@@ -255,8 +326,7 @@ def load_bot_config() -> Dict:
 
 
 def save_bot_config(cfg: Dict) -> None:
-    with open(BOT_CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, sort_keys=True)
+    write_json_atomic(BOT_CONFIG_FILE, cfg)
 
 
 def telegram_get_updates(offset: int) -> List[Dict]:
@@ -271,16 +341,17 @@ def telegram_get_updates(offset: int) -> List[Dict]:
     return resp.json().get("result", [])
 
 
-FREQ_COMMAND_REGEX = re.compile(r"^/freq(?:uency)?(?:@\w+)?\s*(.*)$", re.IGNORECASE)
+FREQ_COMMAND_REGEX = re.compile(r"^/freq(?:uency)?(?:@\w+)?(?:\s+(.*))?$", re.IGNORECASE | re.DOTALL)
 TWICE_DAILY_REGEX = re.compile(r"twice\s*(a\s*)?day|twice\s*daily", re.IGNORECASE)
 DAILY_REGEX = re.compile(r"\bdaily\b|\bonce\s*(a\s*)?day\b", re.IGNORECASE)
 
 
-def parse_frequency_minutes(text: str) -> Optional[int]:
-    """Returns a clamped interval in minutes, or None if `text` doesn't ask for one."""
-    t = text.strip()
-    m = FREQ_COMMAND_REGEX.match(t)
-    arg = m.group(1).strip() if m else t
+def parse_frequency_minutes(arg: str) -> Optional[int]:
+    """
+    Parses the argument of a /freq command (the text after "/freq") into a clamped
+    interval in minutes, or None if it isn't one we understand.
+    """
+    arg = arg.strip()
     if not arg:
         return None
     # Check "twice daily" before plain "daily" since the latter matches the former's text too.
@@ -311,7 +382,8 @@ def process_telegram_commands(cfg: Dict) -> Dict:
     try:
         updates = telegram_get_updates(cfg.get("last_update_id", 0) + 1)
     except requests.RequestException as e:
-        print(f"Telegram getUpdates failed, skipping command check this run: {e}")
+        # Class name only: the exception text embeds the request URL, which contains the bot token.
+        print(f"Telegram getUpdates failed, skipping command check this run: {e.__class__.__name__}")
         return cfg
 
     for update in updates:
@@ -325,21 +397,20 @@ def process_telegram_commands(cfg: Dict) -> Dict:
         if chat_id not in allowed:
             continue
 
-        text = message["text"]
-        lowered = text.lower()
-        if not FREQ_COMMAND_REGEX.match(text) and not any(w in lowered for w in ("twice", "daily", "every")):
+        # Only an explicit /freq (or /frequency) command changes the interval; ordinary
+        # chat ("see you every Saturday", "daily driver") must never retune the watcher.
+        m = FREQ_COMMAND_REGEX.match(message["text"].strip())
+        if not m:
             continue
+        arg = (m.group(1) or "").strip()
 
-        m = FREQ_COMMAND_REGEX.match(text)
-        arg = (m.group(1).strip() if m else text.strip())
-
-        if m and not arg:
-            telegram_notify(f"Checking every {cfg['interval_minutes']} min.", chat_ids=[chat_id])
+        if not arg:
+            safe_notify(f"Checking every {cfg['interval_minutes']} min.", chat_ids=[chat_id])
             continue
 
         minutes = parse_frequency_minutes(arg)
         if minutes is None:
-            telegram_notify(
+            safe_notify(
                 f"Didn't catch that. Send /freq <1-{MAX_INTERVAL_MINUTES}> (minutes), /freq daily, or "
                 f"/freq twice daily. Currently every {cfg['interval_minutes']} min.",
                 chat_ids=[chat_id],
@@ -347,13 +418,13 @@ def process_telegram_commands(cfg: Dict) -> Dict:
             continue
 
         cfg["interval_minutes"] = minutes
-        telegram_notify(f"Checking every {minutes} min.", chat_ids=[chat_id])
+        safe_notify(f"Checking every {minutes} min.", chat_ids=[chat_id])
 
     return cfg
 
 
 def display_name(key: str) -> str:
-    return key.split(" :: ", 1)[-1]
+    return key.split(KEY_SEP, 1)[-1]
 
 
 # Above this many newly-opened items, naming each one gets too long to glance at or
@@ -389,7 +460,7 @@ def report_problem(bot_cfg: Dict, problem: str) -> None:
     if not bot_cfg.get("problem_reported"):
         bot_cfg["problem_reported"] = True
         save_bot_config(bot_cfg)
-        telegram_notify(f"⚠️ Snowbasin watcher: {problem}. I'll keep trying and let you know when it's working again.")
+        safe_notify(f"⚠️ Snowbasin watcher: {problem}. I'll keep trying and let you know when it's working again.")
 
 
 def main():
@@ -427,7 +498,7 @@ def main():
         report_problem(bot_cfg, f"couldn't load the mountain report ({e.__class__.__name__})")
         return
 
-    lifts, trails, gates = parse_report(lines)
+    lifts, trails, gates = (stable_keys(d) for d in parse_report(lines))
 
     if DEBUG:
         print(f"Total lines: {len(lines)}")
@@ -448,18 +519,22 @@ def main():
 
     if bot_cfg.pop("problem_reported", None):
         save_bot_config(bot_cfg)
-        telegram_notify("Snowbasin watcher is reading the mountain report again ✅")
+        safe_notify("Snowbasin watcher is reading the mountain report again ✅")
 
     current = {"lifts": lifts, "trails": trails, "gates": gates}
 
     prev = load_state()
     first_run = (not prev["lifts"] and not prev["trails"] and not prev["gates"])
 
-    newly_open_lifts = sorted(k for k, v in lifts.items() if v == "Lift Open" and prev["lifts"].get(k) != v)
-    newly_open_trails = sorted(k for k, v in trails.items() if v == "Trail Open" and prev["trails"].get(k) != v)
+    newly_open_lifts = sorted(
+        k for k, v in lifts.items() if v == "Lift Open" and previous_status(prev["lifts"], k) != v
+    )
+    newly_open_trails = sorted(
+        k for k, v in trails.items() if v == "Trail Open" and previous_status(prev["trails"], k) != v
+    )
     newly_open_gates = sorted(
         k for k, v in gates.items()
-        if v in ("Gate Open", "Trail Open", "Lift Open") and prev["gates"].get(k) != v
+        if v in ("Gate Open", "Trail Open", "Lift Open") and previous_status(prev["gates"], k) != v
     )
 
     save_state(current)
@@ -472,6 +547,11 @@ def main():
         print("No new opens.")
         return
 
+    # If every chat fails this raises and the run fails visibly (GitHub emails the owner).
+    # The new state was already saved above and the workflow's commit step still runs
+    # after a failure, so the next ping won't re-detect and re-send (and fail) the same
+    # alert every minute. The trade-off is that an alert lost to a total Telegram outage
+    # isn't retried; the failed run is the signal to go look.
     telegram_notify(build_notification_text(newly_open_lifts, newly_open_trails, newly_open_gates))
     print("Notification sent.")
 
